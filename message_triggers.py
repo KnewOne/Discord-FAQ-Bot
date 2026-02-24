@@ -10,55 +10,53 @@ DB_PATH = Path(__file__).parent / "database.db"
 
 
 def init_db():
-    """Initialize the SQLite database and create the triggers table if it doesn't exist."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
                    CREATE TABLE IF NOT EXISTS message_triggers
                    (
-                       id
-                       INTEGER
-                       PRIMARY
-                       KEY
-                       AUTOINCREMENT,
-                       channel_id
-                       INTEGER
-                       NOT
-                       NULL,
-                       guild_id
-                       INTEGER
-                       NOT
-                       NULL,
-                       message_id
-                       INTEGER
-                       NOT
-                       NULL,
-                       message_url
-                       TEXT
-                       NOT
-                       NULL,
-                       patterns
-                       TEXT
-                       NOT
-                       NULL,
-                       response_text
-                       TEXT,
-                       created_by
-                       INTEGER
-                       NOT
-                       NULL,
-                       UNIQUE
-                   (
-                       channel_id,
-                       message_id
-                   )
-                       )
-                   """)
-    # Add response_text column if it doesn't exist (migration)
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       channel_id INTEGER NOT NULL,
+                       guild_id INTEGER NOT NULL,
+                       message_id INTEGER,
+                       message_url TEXT,
+                       patterns TEXT NOT NULL,
+                       response_text TEXT,
+                       created_by INTEGER NOT NULL,
+                       UNIQUE (channel_id, message_id))
+   """)
+    
     cursor.execute("PRAGMA table_info(message_triggers)")
-    columns = [row[1] for row in cursor.fetchall()]
-    if "response_text" not in columns:
-        cursor.execute("ALTER TABLE message_triggers ADD COLUMN response_text TEXT")
+    col_info = {row[1]: row for row in cursor.fetchall()}
+
+    # Migrate: if message_id or message_url are NOT NULL, recreate table to make them nullable
+    # PRAGMA table_info row: (cid, name, type, notnull, dflt_value, pk)
+    needs_migration = (
+        col_info.get("message_id", (None, None, None, 0))[3] == 1 or
+        col_info.get("message_url", (None, None, None, 0))[3] == 1
+    )
+    if needs_migration:
+        cursor.execute("ALTER TABLE message_triggers RENAME TO message_triggers_old")
+        cursor.execute("""
+            CREATE TABLE message_triggers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                message_id INTEGER,
+                message_url TEXT,
+                patterns TEXT NOT NULL,
+                response_text TEXT,
+                created_by INTEGER NOT NULL,
+                UNIQUE (channel_id, message_id)
+            )
+        """)
+        cursor.execute("""
+            INSERT INTO message_triggers (id, channel_id, guild_id, message_id, message_url, patterns, response_text, created_by)
+            SELECT id, channel_id, guild_id, message_id, message_url, patterns, response_text, created_by
+            FROM message_triggers_old
+        """)
+        cursor.execute("DROP TABLE message_triggers_old")
+
     conn.commit()
     conn.close()
 
@@ -78,32 +76,34 @@ class MessageTriggers(commands.Cog):
     async def set_trigger(
             self,
             ctx: discord.ApplicationContext,
-            message_url: Option(str, "The message URL to link to", required=True),
             patterns: Option(str, "Comma-separated regex patterns to match", required=True),
-            response_text: Option(str, "Response text (use <> as placeholder for link)", required=False, default=None),
+            response_text: Option(str, "Response text (use <> as placeholder for link)", required=True),
+            message_url: Option(str, "The message URL to link to (optional)", required=False, default=None),
     ):
-        # Parse message URL to get message ID
-        # Format: https://discord.com/channels/guild_id/channel_id/message_id
-        url_pattern = r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)"
-        match = re.match(url_pattern, message_url)
-        if not match:
-            await ctx.respond("Invalid message URL format.", ephemeral=True)
-            return
+        message_id = None
+        if message_url is not None:
+            # Parse message URL to get message ID
+            # Format: https://discord.com/channels/guild_id/channel_id/message_id
+            url_pattern = r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)"
+            match = re.match(url_pattern, message_url)
+            if not match:
+                await ctx.respond("Invalid message URL format.", ephemeral=True)
+                return
 
-        guild_id, target_channel_id, message_id = map(int, match.groups())
+            guild_id, target_channel_id, message_id = map(int, match.groups())
 
-        # Verify the message exists and is accessible
-        try:
-            target_channel = self.bot.get_channel(target_channel_id)
-            if target_channel is None:
-                target_channel = await self.bot.fetch_channel(target_channel_id)
-            await target_channel.fetch_message(message_id)
-        except discord.NotFound:
-            await ctx.respond("Message not found.", ephemeral=True)
-            return
-        except discord.Forbidden:
-            await ctx.respond("I don't have access to that message.", ephemeral=True)
-            return
+            # Verify the message exists and is accessible
+            try:
+                target_channel = self.bot.get_channel(target_channel_id)
+                if target_channel is None:
+                    target_channel = await self.bot.fetch_channel(target_channel_id)
+                await target_channel.fetch_message(message_id)
+            except discord.NotFound:
+                await ctx.respond("Message not found.", ephemeral=True)
+                return
+            except discord.Forbidden:
+                await ctx.respond("I don't have access to that message.", ephemeral=True)
+                return
 
         # Validate regex patterns
         pattern_list = [p.strip() for p in patterns.split(",") if p.strip()]
@@ -122,24 +122,24 @@ class MessageTriggers(commands.Cog):
 
         conn = self._get_conn()
         cursor = conn.cursor()
-        # Delete existing trigger for this channel/message
-        cursor.execute("""
-                       DELETE
-                           FROM message_triggers
-                           WHERE channel_id = ?
-                             AND message_id = ?
-                       """, (ctx.channel_id, message_id))
+        if message_id is not None:
+            # Delete existing trigger for this channel/message
+            cursor.execute(
+                "DELETE FROM message_triggers WHERE channel_id = ? AND message_id = ?",
+                (ctx.channel_id, message_id)
+            )
         # Insert the new/updated trigger
-        cursor.execute("""
-                       INSERT INTO message_triggers (channel_id, guild_id, message_id, message_url, patterns, response_text, created_by)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)
-                       """, (ctx.channel_id, ctx.guild_id, message_id, message_url, patterns_str, response_text, ctx.author.id))
+        cursor.execute(
+            "INSERT INTO message_triggers (channel_id, guild_id, message_id, message_url, patterns, response_text, created_by)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ctx.channel_id, ctx.guild_id, message_id, message_url, patterns_str, response_text, ctx.author.id)
+        )
         conn.commit()
         conn.close()
 
-        response_info = f"Trigger set for message {message_url}\nPatterns: `{patterns_str}`"
-        if response_text:
-            response_info += f"\nResponse: `{response_text}`"
+        response_info = f"Trigger set.\nPatterns: `{patterns_str}`\nResponse: `{response_text}`"
+        if message_url:
+            response_info += f"\nURL: {message_url}"
         await ctx.respond(response_info, ephemeral=True)
 
     @commands.has_permissions(manage_messages=True)
@@ -239,14 +239,14 @@ class MessageTriggers(commands.Cog):
             for pattern in patterns:
                 try:
                     if re.search(pattern, content, re.IGNORECASE):
-                        # Build response with link
-                        if response_text:
+                        reply_content = response_text
+
+                        if message_url:
                             if "<>" in response_text:
                                 reply_content = response_text.replace("<>", message_url)
                             else:
                                 reply_content = f"{response_text} {message_url}"
-                        else:
-                            reply_content = message_url
+
                         try:
                             await message.reply(reply_content, mention_author=True)
                         except discord.HTTPException:
