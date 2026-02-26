@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -7,7 +8,6 @@ from re import match
 
 import discord
 import requests
-from bs4 import BeautifulSoup
 from discord import Message, Option
 from discord.ext import commands
 
@@ -21,71 +21,79 @@ class MessageManagement(commands.Cog):
         self.bot = bot
 
     @staticmethod
+    def _get_blizzard_token() -> str:
+        client_id = os.environ.get("BLIZZARD_API_ID")
+        client_secret = os.environ.get("BLIZZARD_API_SECRET")
+        response = requests.post(
+            "https://oauth.battle.net/token",
+            data={"grant_type": "client_credentials"},
+            auth=(client_id, client_secret)
+        )
+        response.raise_for_status()
+        return response.json()["access_token"]
+
+    @staticmethod
     def fix_item_links(message: Message) -> None:
-        # Regular expression to find unfixed links that are not already fixed
-        unfixed_link_pattern = r'https://www.wowhead.com(?:/ru)?/item=\d+(?:/[^\s\)]*)?'
-        fixed_link_pattern = r'\[.*?\]\(https://www.wowhead.com(?:/ru)?/item=\d+(?:/[^\s\)]*)?\)'
+        # Match any wowhead URL containing item=<id> that is not already a markdown link
+        unfixed_link_pattern = r'https://(?:www\.)?wowhead\.com/[^\s\)]*item=(\d+)[^\s\)]*'
 
-        def get_item_name(url):
+        def get_item_name(item_id: str, token: str) -> str | None:
             try:
-                # Convert any English URL to its Russian equivalent
-                url = re.sub(r'https://www.wowhead.com/item=', 'https://www.wowhead.com/ru/item=', url)
-
-                response = requests.get(url)
+                response = requests.get(
+                    f"https://eu.api.blizzard.com/data/wow/item/{item_id}",
+                    params={"namespace": "static-eu", "locale": "ru_RU"},
+                    headers={"Authorization": f"Bearer {token}"}
+                )
                 response.raise_for_status()
-                soup = BeautifulSoup(response.content, 'html.parser')
-                item_name = soup.find(class_='main').find(class_='text').find(class_='heading-size-1').get_text(strip=True)
-                return item_name
+                return response.json()["name"]
             except Exception as e:
-                print(f"Error fetching item name from {url}: {e}")
+                print(f"Error fetching item name for id={item_id}: {e}")
                 return None
 
-        def replace_link(url, item_name):
-            item_id_match = re.search(r'item=(\d+)', url)
-            if item_id_match and item_name:
-                item_id = item_id_match.group(1)
-                ru_url = f"https://www.wowhead.com/ru/item={item_id}"
-                return f'[{item_name}]({ru_url})'
-            return url
+        # Collect unique item IDs from unfixed links (skip already-fixed markdown links)
+        fixed_link_re = re.compile(r'\[.*?\]\(https://(?:www\.)?wowhead\.com/[^\)]*item=\d+[^\)]*\)')
+        unfixed_link_re = re.compile(unfixed_link_pattern)
 
-        # Split the content into parts where there are fixed links and unfixed links
-        parts = re.split(f'({fixed_link_pattern})', message.content)
-        new_parts = []
-        links_to_fix = []
+        # Remove fixed links from consideration by blanking them, then find bare URLs
+        blanked = fixed_link_re.sub(lambda m: ' ' * len(m.group()), message.content)
+        item_ids = list(dict.fromkeys(unfixed_link_re.findall(blanked)))
 
-        # Collect all unfixed links in parts that need replacing
-        for part in parts:
-            if re.match(fixed_link_pattern, part):
-                new_parts.append(part)
-            else:
-                # Find all unfixed links in this part
-                unfixed_links = re.findall(unfixed_link_pattern, part)
-                if unfixed_links:
-                    links_to_fix.extend(unfixed_links)
-                new_parts.append(part)
+        if not item_ids:
+            return
 
-        # Use ThreadPoolExecutor to process links in parallel
-        link_to_name = {}
+        token = MessageManagement._get_blizzard_token()
+
+        # Fetch all item names in parallel
+        id_to_name = {}
         with ThreadPoolExecutor() as executor:
-            future_to_url = {executor.submit(get_item_name, url): url for url in links_to_fix}
-            for future in as_completed(future_to_url):
-                url = future_to_url[future]
-                try:
-                    item_name = future.result()
-                    link_to_name[url] = item_name
-                except Exception as e:
-                    print(f"Error processing link {url}: {e}")
+            future_to_id = {executor.submit(get_item_name, item_id, token): item_id for item_id in item_ids}
+            for future in as_completed(future_to_id):
+                item_id = future_to_id[future]
+                name = future.result()
+                if name:
+                    id_to_name[item_id] = name
 
-        # Replace unfixed links in new_parts with the fetched item names
-        for i, part in enumerate(new_parts):
-            if not re.match(fixed_link_pattern, part):
-                for url, item_name in link_to_name.items():
-                    if url in part:
-                        part = part.replace(url, replace_link(url, item_name))
-                new_parts[i] = part
+        # Replace bare wowhead item URLs with fixed markdown links
+        def replace_match(m):
+            item_id = m.group(1)
+            name = id_to_name.get(item_id)
+            if name:
+                return f'[{name}](https://www.wowhead.com/ru/item={item_id})'
+            return m.group(0)
 
-        # Reassemble the content
-        message.content = ''.join(new_parts)
+        # Only replace URLs that are not already inside a markdown link
+        def replace_unfixed(content: str) -> str:
+            result = []
+            pos = 0
+            for fixed in fixed_link_re.finditer(content):
+                chunk = content[pos:fixed.start()]
+                result.append(unfixed_link_re.sub(replace_match, chunk))
+                result.append(fixed.group(0))
+                pos = fixed.end()
+            result.append(unfixed_link_re.sub(replace_match, content[pos:]))
+            return ''.join(result)
+
+        message.content = replace_unfixed(message.content)
 
     @commands.slash_command(description="Dump messages to user id")
     @commands.is_owner()
